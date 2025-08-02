@@ -7,6 +7,7 @@ package oshi.hardware.platform.windows;
 import java.util.ArrayList;
 import java.util.List;
 
+import com.sun.jna.platform.win32.WinDef;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -18,6 +19,8 @@ import com.sun.jna.platform.win32.WinError;
 import com.sun.jna.platform.win32.WinNT;
 import com.sun.jna.platform.win32.WinNT.HANDLE;
 import com.sun.jna.platform.win32.WinReg.HKEY;
+import com.sun.jna.platform.win32.User32;
+import oshi.hardware.platform.windows.DISPLAY_DEVICE;
 
 import oshi.annotation.concurrent.Immutable;
 import oshi.hardware.Display;
@@ -25,6 +28,9 @@ import oshi.hardware.common.AbstractDisplay;
 import oshi.jna.ByRef.CloseableIntByReference;
 import oshi.jna.Struct.CloseableSpDeviceInterfaceData;
 import oshi.jna.Struct.CloseableSpDevinfoData;
+
+import static oshi.hardware.platform.windows.DISPLAY_DEVICE.DisplayDeviceFlags.DISPLAY_DEVICE_ACTIVE;
+import static oshi.hardware.platform.windows.DISPLAY_DEVICE.DisplayDeviceFlags.DISPLAY_DEVICE_PRIMARY_DEVICE;
 
 /**
  * A Display
@@ -58,20 +64,20 @@ final class WindowsDisplay extends AbstractDisplay {
         List<Display> displays = new ArrayList<>();
 
         HANDLE hDevInfo = SU.SetupDiGetClassDevs(GUID_DEVINTERFACE_MONITOR, null, null,
-                SetupApi.DIGCF_PRESENT | SetupApi.DIGCF_DEVICEINTERFACE);
+            SetupApi.DIGCF_PRESENT | SetupApi.DIGCF_DEVICEINTERFACE);
         if (!hDevInfo.equals(WinBase.INVALID_HANDLE_VALUE)) {
             try (CloseableSpDeviceInterfaceData deviceInterfaceData = new CloseableSpDeviceInterfaceData();
-                    CloseableSpDevinfoData info = new CloseableSpDevinfoData()) {
+                 CloseableSpDevinfoData info = new CloseableSpDevinfoData()) {
                 deviceInterfaceData.cbSize = deviceInterfaceData.size();
 
                 for (int memberIndex = 0; SU.SetupDiEnumDeviceInfo(hDevInfo, memberIndex, info); memberIndex++) {
                     HKEY key = SU.SetupDiOpenDevRegKey(hDevInfo, info, SetupApi.DICS_FLAG_GLOBAL, 0, SetupApi.DIREG_DEV,
-                            WinNT.KEY_QUERY_VALUE);
+                        WinNT.KEY_QUERY_VALUE);
 
                     byte[] edid = new byte[1];
 
                     try (CloseableIntByReference pType = new CloseableIntByReference();
-                            CloseableIntByReference lpcbData = new CloseableIntByReference()) {
+                         CloseableIntByReference lpcbData = new CloseableIntByReference()) {
                         if (ADV.RegQueryValueEx(key, "EDID", 0, pType, edid, lpcbData) == WinError.ERROR_MORE_DATA) {
                             edid = new byte[lpcbData.getValue()];
                             if (ADV.RegQueryValueEx(key, "EDID", 0, pType, edid, lpcbData) == WinError.ERROR_SUCCESS) {
@@ -87,4 +93,29 @@ final class WindowsDisplay extends AbstractDisplay {
         }
         return displays;
     }
+
+    private static void getIsPrimary() {
+        int deviceIndex = 0;
+        DISPLAY_DEVICE dd = new DISPLAY_DEVICE();
+
+        while (MyUser32.INSTANCE.EnumDisplayDevices(null, deviceIndex, dd, 0)) {
+            dd.cb = new WinDef.DWORD(dd.size()); // must reset for each call
+
+            boolean isActive = (dd.StateFlags.intValue() & DISPLAY_DEVICE_ACTIVE) != 0;
+            boolean isPrimary = isActive && (dd.StateFlags.intValue() & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0;
+
+            System.out.printf(
+                "Display %d: %s (%s), isActive=%b, isPrimary=%b%n",
+                deviceIndex,
+                new String(dd.DeviceName).trim(),
+                new String(dd.DeviceString).trim(),
+                isActive,
+                isPrimary
+            );
+
+            deviceIndex++;
+            dd = new DISPLAY_DEVICE();
+        }
+    }
+
 }
