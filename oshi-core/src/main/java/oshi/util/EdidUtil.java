@@ -4,14 +4,19 @@
  */
 package oshi.util;
 
+import java.io.UnsupportedEncodingException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+//import org.slf4j.Logger;
+//import org.slf4j.LoggerFactory;
 
 import oshi.annotation.SuppressForbidden;
 import oshi.annotation.concurrent.ThreadSafe;
@@ -22,7 +27,7 @@ import oshi.annotation.concurrent.ThreadSafe;
 @ThreadSafe
 public final class EdidUtil {
 
-    private static final Logger LOG = LoggerFactory.getLogger(EdidUtil.class);
+   // private static final Logger LOG = LoggerFactory.getLogger(EdidUtil.class);
 
     private EdidUtil() {
     }
@@ -38,7 +43,7 @@ public final class EdidUtil {
         // Bytes 8-9 are manufacturer ID in 3 5-bit characters.
         String temp = String.format(Locale.ROOT, "%8s%8s", Integer.toBinaryString(edid[8] & 0xFF),
                 Integer.toBinaryString(edid[9] & 0xFF)).replace(' ', '0');
-        LOG.debug("Manufacurer ID: {}", temp);
+        //LOG.debug("Manufacurer ID: {}", temp);
         return String.format(Locale.ROOT, "%s%s%s", (char) (64 + Integer.parseInt(temp.substring(1, 6), 2)),
                 (char) (64 + Integer.parseInt(temp.substring(6, 11), 2)),
                 (char) (64 + Integer.parseInt(temp.substring(11, 16), 2))).replace("@", "");
@@ -64,9 +69,9 @@ public final class EdidUtil {
      */
     public static String getSerialNo(byte[] edid) {
         // Bytes 12-15 are Serial number (last 4 characters)
-        if (LOG.isDebugEnabled()) {
-            LOG.debug("Serial number: {}", Arrays.toString(Arrays.copyOfRange(edid, 12, 16)));
-        }
+//        if (LOG.isDebugEnabled()) {
+//            LOG.debug("Serial number: {}", Arrays.toString(Arrays.copyOfRange(edid, 12, 16)));
+//        }
         return String.format(Locale.ROOT, "%s%s%s%s", getAlphaNumericOrHex(edid[15]), getAlphaNumericOrHex(edid[14]),
                 getAlphaNumericOrHex(edid[13]), getAlphaNumericOrHex(edid[12]));
     }
@@ -96,7 +101,7 @@ public final class EdidUtil {
     public static int getYear(byte[] edid) {
         // Byte 17 is manufacture year-1990
         byte temp = edid[17];
-        LOG.debug("Year-1990: {}", temp);
+        //LOG.debug("Year-1990: {}", temp);
         return temp + 1990;
     }
 
@@ -242,6 +247,147 @@ public final class EdidUtil {
             model = tokens[tokens.length - 1];
         }
         return model.trim();
+    }
+
+    public static List<String> parseEDIDResolutions(byte[] edid) {
+        Set<String> resolutions = new LinkedHashSet<>();
+
+        // --- 1. Established Timings ---
+        byte t1 = edid[0x23];
+        byte t2 = edid[0x24];
+        byte t3 = edid[0x25];
+
+        String[] establishedTimings = {
+            "720x400", "720x400", "640x480", "640x480", "640x480", "640x480", "800x600", "800x600",
+            "800x600", "800x600", "832x624", "1024x768", "1024x768", "1024x768", "1280x1024", "1152x870"
+        };
+
+        for (int i = 0; i < 8; i++) if ((t1 & (1 << (7 - i))) != 0) resolutions.add(establishedTimings[i]);
+        for (int i = 0; i < 8; i++) if ((t2 & (1 << (7 - i))) != 0) resolutions.add(establishedTimings[i + 8]);
+        if ((t3 & 0x80) != 0) resolutions.add(establishedTimings[15]);
+
+        // --- 2. Standard Timings ---
+        for (int i = 0x26; i <= 0x35; i += 2) {
+            int b1 = edid[i] & 0xFF;
+            int b2 = edid[i + 1] & 0xFF;
+            if (b1 == 0x01 && b2 == 0x01) continue;
+
+            int hActive = (b1 + 31) * 8;
+            int aspectBits = (b2 >> 6) & 0x03;
+            double aspectRatio;
+            if (aspectBits == 0) {
+                aspectRatio = 16.0 / 10;
+            } else if (aspectBits == 1) {
+                aspectRatio = 4.0 / 3;
+            } else if (aspectBits == 2) {
+                aspectRatio = 5.0 / 4;
+            } else if (aspectBits == 3) {
+                aspectRatio = 16.0 / 9;
+            } else {
+                aspectRatio = 1.0;
+            }
+            int vActive = (int) Math.round(hActive / aspectRatio);
+            resolutions.add(hActive + "x" + vActive);
+        }
+
+        // --- 3. Detailed Timing Descriptors (DTDs) ---
+        for (int i = 0x36; i <= 0x6C; i += 18) {
+            int pixelClock = ((edid[i + 1] & 0xFF) << 8) | (edid[i] & 0xFF);
+            if (pixelClock == 0) continue;
+
+            int hActive = ((edid[i + 4] & 0xF0) << 4) | (edid[i + 2] & 0xFF);
+            int vActive = ((edid[i + 7] & 0xF0) << 4) | (edid[i + 5] & 0xFF);
+
+            if (hActive > 300 && vActive > 200 && hActive < 8000 && vActive < 8000)
+                resolutions.add(hActive + "x" + vActive);
+        }
+
+        // --- 4. CTA-861 Extension Block ---
+        int numExtensions = edid[0x7E] & 0xFF;
+        if (numExtensions > 0 && edid.length >= 256) {
+            int base = 128;
+            if (edid[base] == 0x02) { // CTA-861 tag
+                int dtdStart = edid[base + 2] & 0xFF;
+                int i = base + 4;
+                while (i < base + dtdStart) {
+                    int tag = (edid[i] & 0xE0) >> 5;
+                    int len = edid[i] & 0x1F;
+                    if (tag == 0x02) { // Video Data Block (VDB)
+                        for (int j = 1; j <= len; j++) {
+                            int vic = edid[i + j] & 0x7F; // 7-bit VIC
+                            String res = getResolutionForVIC(vic);
+                            if (res != null) resolutions.add(res);
+                        }
+                    }
+                    i += (1 + len);
+                }
+            }
+        }
+
+        return new ArrayList<>(resolutions);
+    }
+
+    // Maps CTA-861 VIC codes to common resolutions
+    private static String getResolutionForVIC(int vic) {
+        if (vic == 1) {
+            return "640x480";
+        } else if (vic == 2 || vic == 3) {
+            return "720x480";
+        } else if (vic == 4 || vic == 19) {
+            return "1280x720";
+        } else if (vic == 5 || vic == 20) {
+            return "1920x1080i";
+        } else if (vic == 16 || vic == 31) {
+            return "1920x1080";
+        } else if (vic == 17 || vic == 18) {
+            return "720x576";
+        } else {
+            return null;
+        }
+    }
+
+    // Example usage
+    public static void main(String[] args) {
+        byte[] edid = new byte[] {
+            (byte)0x00, (byte)0xff, (byte)0xff, (byte)0xff, (byte)0xff, (byte)0xff, (byte)0xff, (byte)0x00,
+            (byte)0x10, (byte)0xac, (byte)0x13, (byte)0x41, (byte)0x4c, (byte)0x57, (byte)0x53, (byte)0x42,
+            (byte)0x16, (byte)0x1c, (byte)0x01, (byte)0x04, (byte)0xa5, (byte)0x35, (byte)0x1e, (byte)0x78,
+            (byte)0x3e, (byte)0xee, (byte)0x95, (byte)0xa3, (byte)0x54, (byte)0x4c, (byte)0x99, (byte)0x26,
+            (byte)0x0f, (byte)0x50, (byte)0x54, (byte)0xa5, (byte)0x4b, (byte)0x80, (byte)0x71, (byte)0x4f,
+            (byte)0x81, (byte)0x00, (byte)0x81, (byte)0x80, (byte)0xa9, (byte)0xc0, (byte)0xd1, (byte)0xc0,
+            (byte)0x01, (byte)0x01, (byte)0x01, (byte)0x01, (byte)0x02, (byte)0x3a, (byte)0x80, (byte)0x18,
+            (byte)0x71, (byte)0x38, (byte)0x2d, (byte)0x40, (byte)0x58, (byte)0x2c, (byte)0x45, (byte)0x00,
+            (byte)0x0f, (byte)0x28, (byte)0x21, (byte)0x00, (byte)0x00, (byte)0x1e, (byte)0x00, (byte)0x00,
+            (byte)0x00, (byte)0xff, (byte)0x00, (byte)0x54, (byte)0x56, (byte)0x54, (byte)0x37, (byte)0x46,
+            (byte)0x38, (byte)0x35, (byte)0x55, (byte)0x42, (byte)0x53, (byte)0x57, (byte)0x4c, (byte)0x0a,
+            (byte)0x00, (byte)0x00, (byte)0x00, (byte)0xfc, (byte)0x00, (byte)0x44, (byte)0x45, (byte)0x4c,
+            (byte)0x4c, (byte)0x20, (byte)0x50, (byte)0x32, (byte)0x34, (byte)0x31, (byte)0x38, (byte)0x48,
+            (byte)0x54, (byte)0x0a, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0xfd, (byte)0x00, (byte)0x32,
+            (byte)0x4c, (byte)0x1e, (byte)0x53, (byte)0x11, (byte)0x00, (byte)0x0a, (byte)0x20, (byte)0x20,
+            (byte)0x20, (byte)0x20, (byte)0x20, (byte)0x20, (byte)0x01, (byte)0x7e, (byte)0x02, (byte)0x03,
+            (byte)0x18, (byte)0xf1, (byte)0x4b, (byte)0x90, (byte)0x05, (byte)0x04, (byte)0x03, (byte)0x02,
+            (byte)0x01, (byte)0x11, (byte)0x12, (byte)0x13, (byte)0x14, (byte)0x1f, (byte)0x23, (byte)0x09,
+            (byte)0x07, (byte)0x07, (byte)0x83, (byte)0x01, (byte)0x00, (byte)0x00, (byte)0x02, (byte)0x3a,
+            (byte)0x80, (byte)0x18, (byte)0x71, (byte)0x38, (byte)0x2d, (byte)0x40, (byte)0x58, (byte)0x2c,
+            (byte)0x45, (byte)0x00, (byte)0x0f, (byte)0x28, (byte)0x21, (byte)0x00, (byte)0x00, (byte)0x1e,
+            (byte)0x01, (byte)0x1d, (byte)0x80, (byte)0x18, (byte)0x71, (byte)0x1c, (byte)0x16, (byte)0x20,
+            (byte)0x58, (byte)0x2c, (byte)0x25, (byte)0x00, (byte)0x0f, (byte)0x28, (byte)0x21, (byte)0x00,
+            (byte)0x00, (byte)0x9e, (byte)0x01, (byte)0x1d, (byte)0x00, (byte)0x72, (byte)0x51, (byte)0xd0,
+            (byte)0x1e, (byte)0x20, (byte)0x6e, (byte)0x28, (byte)0x55, (byte)0x00, (byte)0x0f, (byte)0x28,
+            (byte)0x21, (byte)0x00, (byte)0x00, (byte)0x1e, (byte)0x8c, (byte)0x0a, (byte)0xd0, (byte)0x8a,
+            (byte)0x20, (byte)0xe0, (byte)0x2d, (byte)0x10, (byte)0x10, (byte)0x3e, (byte)0x96, (byte)0x00,
+            (byte)0x0f, (byte)0x28, (byte)0x21, (byte)0x00, (byte)0x00, (byte)0x18, (byte)0x00, (byte)0x00,
+            (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00,
+            (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00,
+            (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00,
+            (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0xcf
+        };
+
+        List<String> resolutions = parseEDIDResolutions(edid);
+        System.out.println("Supported Resolutions:");
+        for (String res : resolutions) {
+            System.out.println(res);
+        }
     }
 
     /**
